@@ -1,0 +1,125 @@
+#!/bin/bash
+# claude-done: a macOS notification and a sound when Claude Code finishes or needs you.
+# One Bash script, no dependencies. Runs on the Bash 3.2 that ships with macOS.
+# https://github.com/abdiraimov-otabek/claude-done  ·  MIT
+
+VERSION="1.0.0"
+SETTINGS="${CLAUDE_DONE_SETTINGS:-$HOME/.claude/settings.json}"
+CONFIG="${CLAUDE_DONE_CONFIG:-$HOME/.config/claude-done/config}"
+STATE="${TMPDIR:-/tmp}/claude-done"
+
+# Defaults; override any of them in ~/.config/claude-done/config (plain KEY=value lines).
+MIN_SECONDS=20          # stay quiet when a turn took less than this
+SOUND_DONE="Glass"      # any name from /System/Library/Sounds, or "none"
+SOUND_ASK="Ping"
+SOUND_FAIL="Basso"
+NOTIFY_IDLE=0           # 1 = also ping when Claude has sat waiting for input (it already pinged "done")
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+# Read one top-level string/number/bool from JSON on stdin. plutil ships with macOS.
+field() { printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null; }
+
+notify() { # title subtitle body sound
+  if [ -n "$CLAUDE_DONE_DRY" ]; then printf 'NOTIFY|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; return; fi
+  osascript -e 'on run argv' \
+    -e 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)' \
+    -e 'end run' "$1" "$2" "$3" >/dev/null 2>&1
+  [ "$4" != "none" ] && [ -f "/System/Library/Sounds/$4.aiff" ] && afplay "/System/Library/Sounds/$4.aiff" &
+}
+
+duration() { # seconds -> "4m 12s"
+  local s=$1
+  if [ "$s" -ge 3600 ]; then printf '%dh %dm' $((s / 3600)) $((s % 3600 / 60))
+  elif [ "$s" -ge 60 ]; then printf '%dm %ds' $((s / 60)) $((s % 60))
+  else printf '%ds' "$s"; fi
+}
+
+hook() {
+  local input event session project now start took
+  input=$(cat)
+  event=$(field "$input" hook_event_name)
+  session=$(field "$input" session_id | tr -cd 'A-Za-z0-9_-')
+  project=$(basename "$(field "$input" cwd)")
+  [ -z "$project" ] || [ "$project" = "/" ] && project="Claude Code"
+  now=$(date +%s)
+  mkdir -p "$STATE"
+
+  case "$event" in
+    UserPromptSubmit)
+      echo "$now" > "$STATE/$session" ;;
+    Notification)
+      local type message
+      type=$(field "$input" notification_type)
+      [ "$type" = "idle_prompt" ] && [ "$NOTIFY_IDLE" != 1 ] && return 0
+      message=$(field "$input" message)
+      notify "✋ $project needs you" "${message:-Claude Code is waiting for you}" "" "$SOUND_ASK" ;;
+    Stop)
+      [ "$(field "$input" stop_hook_active)" = "true" ] && return 0
+      start=$(cat "$STATE/$session" 2>/dev/null)
+      took=$(( now - ${start:-$now} ))
+      [ -n "$start" ] && [ "$took" -lt "$MIN_SECONDS" ] && return 0
+      local summary
+      summary=$(field "$input" last_assistant_message | tr '\n' ' ' | sed 's/[[:space:]]*$//' | cut -c1-140)
+      notify "✅ $project is done" "${start:+in $(duration "$took")}" "$summary" "$SOUND_DONE" ;;
+    StopFailure)
+      notify "❌ $project stopped" "Claude Code hit an error" "" "$SOUND_FAIL" ;;
+  esac
+  return 0
+}
+
+# install/uninstall edit settings.json with JavaScript for Automation, which ships with macOS.
+edit_settings() { # add|remove
+  mkdir -p "$(dirname "$SETTINGS")"
+  [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.claude-done.bak"
+  osascript -l JavaScript - "$1" "$SETTINGS" "$(command -v claude-done || echo "$0")" <<'JS'
+function run(argv) {
+  var mode = argv[0], path = argv[1], bin = argv[2];
+  var fm = $.NSFileManager.defaultManager, s = {};
+  if (fm.fileExistsAtPath(path)) {
+    var raw = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null).js;
+    if (raw.trim()) s = JSON.parse(raw);
+  }
+  s.hooks = s.hooks || {};
+  var events = ["UserPromptSubmit", "Notification", "Stop", "StopFailure"];
+  var ours = function (h) { return /claude-done'? hook$/.test(h.command || ""); };
+  events.forEach(function (ev) {
+    var groups = (s.hooks[ev] || []).map(function (g) {
+      g.hooks = (g.hooks || []).filter(function (h) { return !ours(h); }); return g;
+    }).filter(function (g) { return g.hooks.length; });
+    if (mode === "add") groups.push({ hooks: [{ type: "command", command: "'" + bin + "' hook" }] });
+    if (groups.length) s.hooks[ev] = groups; else delete s.hooks[ev];
+  });
+  if (!Object.keys(s.hooks).length) delete s.hooks;
+  $(JSON.stringify(s, null, 2) + "\n").writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+}
+JS
+}
+
+case "$1" in
+  hook) hook ;;
+  install)
+    edit_settings add || { echo "Couldn't update $SETTINGS" >&2; exit 1; }
+    echo "✅ claude-done is on. Claude Code will ping you when a task finishes or needs you."
+    echo "   Settings: $SETTINGS (backup: $SETTINGS.claude-done.bak)"
+    echo "   Try it: claude-done test"
+    echo "   Want every session live in your MacBook notch instead? That's Halo: https://halo-mac.com/?ref=claude-done" ;;
+  uninstall)
+    edit_settings remove && echo "claude-done is off. Your other hooks are untouched." ;;
+  test)
+    notify "✅ my-project is done" "in 4m 12s" "Refactored the auth middleware and all tests pass." "$SOUND_DONE"
+    sleep 1.5
+    notify "✋ my-project needs you" "Claude needs your permission to use Bash" "" "$SOUND_ASK" ;;
+  -v|--version) echo "claude-done $VERSION" ;;
+  *)
+    cat <<EOF
+claude-done $VERSION: a notification and a sound when Claude Code finishes or needs you.
+
+  claude-done install     add the hooks to ~/.claude/settings.json (keeps your own hooks)
+  claude-done uninstall   remove only claude-done's hooks
+  claude-done test        show both notifications now
+
+Settings in $CONFIG, for example:
+  MIN_SECONDS=60   SOUND_DONE=Hero   SOUND_ASK=none   NOTIFY_IDLE=1
+EOF
+    ;;
+esac
